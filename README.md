@@ -16,8 +16,10 @@
 
 ## 📦 インストール方法
 
-1. コマンドプロンプトまたはPowerShellを開き、このフォルダに移動して必要なライブラリをインストールします。
+1. このリポジトリを `git clone` するか、ZIPでダウンロードして解凍します。
+2. コマンドプロンプトまたはPowerShellを開き、ダウンロードしたプロジェクトのフォルダ（`Mobile-Prompt-Bridge` の中）に移動し、必要なライブラリをインストールします。
    ```bash
+   cd 任意のパス/Mobile-Prompt-Bridge
    pip install -r requirements.txt
    ```
 
