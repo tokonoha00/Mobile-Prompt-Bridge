@@ -1,0 +1,13 @@
+{
+  "port": 8712,
+  "allowed_window_titles": [
+    "antigravity",
+    "visual studio code",
+    "cursor",
+    "windsurf"
+  ],
+  "focus_key": "None",
+  "send_key": "Enter",
+  "enable_auto_send": false,
+  "security_token": ""
+}
