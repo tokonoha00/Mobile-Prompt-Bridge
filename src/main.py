@@ -219,7 +219,8 @@ def is_chat_opened(hwnd):
 
 
 def get_latest_transcript_path():
-    """最も新しく更新された transcript_full.jsonl ファイルのパスを取得します。なければ transcript.jsonl にフォールバックします。"""
+    """各IDEウィンドウに対応するトランスクリプトを返し、必要に応じて紐づけを更新します。"""
+    global GLOBAL_TARGET_HWND, HWND_TO_TRANSCRIPT, LAST_MAPPED_TRANSCRIPT
     home = os.path.expanduser("~")
     
     pattern_full = os.path.join(home, ".gemini", "antigravity-ide", "brain", "*", ".system_generated", "logs", "transcript_full.jsonl")
@@ -230,12 +231,26 @@ def get_latest_transcript_path():
         files = glob.glob(pattern)
         
     if not files:
-        logger.warning(f"履歴ファイルが見つかりません。")
         return None
         
-    # 更新日時でソートして最新のものを返す
+    # 更新日時でソート
     files.sort(key=os.path.getmtime, reverse=True)
-    return files[0]
+    newest = files[0]
+    
+    # 対象IDEが選択されている場合、新しいログが発生したらそのIDEと紐づける
+    if GLOBAL_TARGET_HWND:
+        if newest != LAST_MAPPED_TRANSCRIPT:
+            HWND_TO_TRANSCRIPT[GLOBAL_TARGET_HWND] = newest
+            LAST_MAPPED_TRANSCRIPT = newest
+
+    # 対象IDEに紐づけられたログがあればそれを返す
+    if GLOBAL_TARGET_HWND and GLOBAL_TARGET_HWND in HWND_TO_TRANSCRIPT:
+        mapped = HWND_TO_TRANSCRIPT[GLOBAL_TARGET_HWND]
+        if os.path.exists(mapped):
+            return mapped
+            
+    # 紐づけがない場合は最新のものを返す（初期状態）
+    return newest
 
 def get_chat_history():
     """下位互換性のため、get_session_state()のログ部分のみを返します。"""
