@@ -50,6 +50,10 @@ logger = logging.getLogger("PromptBridge")
 
 # 設定ファイルの処理
 CONFIG_PATH = "config.json"
+
+# IDEごとのトランスクリプトの紐づけ
+HWND_TO_TRANSCRIPT = {}
+LAST_MAPPED_TRANSCRIPT = None
 TEMPLATE_PATH = "config.example.json"
 
 if not os.path.exists(CONFIG_PATH):
