@@ -1190,8 +1190,73 @@
 
     btnProceed.addEventListener('click', sendProceed);
 
+    // --- IDEウィンドウ複数対応 ---
+    const ideTabsContainer = document.getElementById('ideTabsContainer');
+    const fabBtn = document.getElementById('fabBtn');
+
+    fabBtn.addEventListener('click', () => {
+        showToast("このボタンの機能は今後追加予定です！");
+    });
+
+    async function loadIdeWindows() {
+        try {
+            const response = await fetch('/api/ide_windows', {
+                headers: apiHeaders()
+            });
+            if (response.ok) {
+                const data = await response.json();
+                renderIdeTabs(data.windows, data.active_hwnd);
+            }
+        } catch (e) {
+            console.error("IDEウィンドウ情報の取得に失敗:", e);
+        }
+    }
+
+    function renderIdeTabs(windows, activeHwnd) {
+        ideTabsContainer.innerHTML = '';
+        if (!windows || windows.length === 0) return;
+
+        windows.forEach(win => {
+            const tab = document.createElement('div');
+            tab.className = 'ide-tab';
+            if (win.hwnd === activeHwnd) {
+                tab.classList.add('active');
+            }
+            
+            let shortTitle = win.title.split(' - ')[0];
+            if (shortTitle.length > 15) shortTitle = shortTitle.substring(0, 15) + '...';
+            tab.textContent = shortTitle;
+
+            tab.addEventListener('click', async () => {
+                await setTargetWindow(win.hwnd);
+                loadIdeWindows(); // 画面更新
+            });
+
+            ideTabsContainer.appendChild(tab);
+        });
+    }
+
+    async function setTargetWindow(hwnd) {
+        try {
+            const response = await fetch('/api/set_target_window', {
+                method: 'POST',
+                headers: apiHeaders({'Content-Type': 'application/json'}),
+                body: JSON.stringify({ hwnd: hwnd })
+            });
+            if (response.ok) {
+                showToast("対象のIDEを切り替えました");
+            }
+        } catch (e) {
+            showToast("切り替えに失敗しました", true);
+        }
+    }
+
+    // 定期的にIDEリストを更新 (5秒ごと)
+    setInterval(loadIdeWindows, 5000);
+
     // 初期化
     if (token) {
+        loadIdeWindows();
         loadConfig();
         loadHistory();
         loadChatHistory();
