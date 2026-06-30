@@ -522,8 +522,15 @@
             <span style="color: #f59e0b; font-weight: 700;">🖥️ PC画面上の質問 (ask_question)</span>
             <span id="questionScanMethod" style="font-size: 0.75rem; color: var(--text-muted);"></span>
         </div>
-        <div style="display: flex; gap: 8px; margin-bottom: 8px;">
-            <button class="btn" style="background: var(--primary); font-weight: 700;" id="btnScanQuestion">画面をスキャンして質問を読み取る</button>
+        <div style="display: flex; gap: 8px; margin-bottom: 8px; align-items: center; flex-wrap: wrap;">
+            <label for="autoScanInterval" style="font-size: 0.85rem; font-weight: 600;">自動スキャン:</label>
+            <select id="autoScanInterval" style="background: rgba(0,0,0,0.5); color: var(--text-color); border: 1px solid rgba(255,255,255,0.2); border-radius: 4px; padding: 4px 8px; font-size: 0.85rem;">
+                <option value="0">オフ (手動)</option>
+                <option value="5000">5秒</option>
+                <option value="10000">10秒</option>
+                <option value="30000">30秒</option>
+            </select>
+            <button class="btn" style="background: var(--primary); font-weight: 700; padding: 6px 12px; margin-left: auto;" id="btnScanQuestion">手動スキャン</button>
         </div>
         <div id="questionContainer" style="display: none; flex-direction: column; gap: 12px;">
             <div id="questionText" style="font-size: 0.95rem; line-height: 1.5; color: var(--text-color); font-weight: 600; white-space: pre-wrap; padding: 10px; background: rgba(0,0,0,0.3); border-radius: 8px;">
@@ -706,6 +713,10 @@
     const questionSubmitBtn = document.getElementById('questionSubmitBtn');
     const questionSubmitStatus = document.getElementById('questionSubmitStatus');
     const questionContainer = document.getElementById('questionContainer');
+    const btnScanQuestion = document.getElementById('btnScanQuestion');
+    const questionScanMethod = document.getElementById('questionScanMethod');
+
+    // 画面スキャン
                 const resData = await response.json();
             
             if (response.ok && resData.ok) {

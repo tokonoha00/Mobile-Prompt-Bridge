@@ -24,7 +24,12 @@ import cv2
 import numpy as np
 import mss
 import asyncio
+from winsdk.windows.media.ocr import OcrEngine
+from winsdk.windows.globalization import Language
+from winsdk.windows.graphics.imaging import SoftwareBitmap, BitmapPixelFormat, BitmapAlphaMode
 
+# グローバルなスキャン結果保存用
+LATEST_SCAN_RESULT = None
 
 # ログディレクトリの作成
 os.makedirs("logs", exist_ok=True)
@@ -1050,3 +1055,296 @@ def extract_question_via_uia(hwnd):
         logger.error(f"UIA抽出中にエラー: {e}")
         return None
 
+async def extract_question_via_ocr(hwnd):
+    """Windows Media OCR を用いて質問を抽出します"""
+    rect = RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+        
+    # ウィンドウの右側部分（チャットパネル）を切り出す
+    width = rect.right - rect.left
+    height = rect.bottom - rect.top
+    
+    # mss でスクリーンショット
+    with mss.mss() as sct:
+        # ディスプレイ全体座標での切り出し
+        # 念のためウィンドウ全体をキャプチャし、後で右側をクロップする
+        monitor = {"top": rect.top, "left": rect.left, "width": width, "height": height}
+        try:
+            sct_img = sct.grab(monitor)
+            img = np.array(sct_img)
+        except Exception as e:
+            logger.error(f"mss grab error: {e}")
+            return None
+            
+    # 右側40%くらいがチャット欄と仮定
+    crop_x = int(width * 0.6)
+    chat_img = img[:, crop_x:]
+    chat_global_offset_x = rect.left + crop_x
+    chat_global_offset_y = rect.top
+    
+    # デバッグ用に画像を保存
+    debug_dir = "logs/debug"
+    os.makedirs(debug_dir, exist_ok=True)
+    debug_filename = f"{debug_dir}/question_scan_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+    cv2.imwrite(debug_filename, chat_img)
+    
+    # OpenCV (BGRA) -> SoftwareBitmap (RGBA)
+    img_bgra = cv2.cvtColor(chat_img, cv2.COLOR_BGRA2RGBA)
+    h, w, _ = img_bgra.shape
+    software_bitmap = SoftwareBitmap(BitmapPixelFormat.RGBA8, w, h, BitmapAlphaMode.PREMULTIPLIED)
+    software_bitmap.copy_from_buffer(memoryview(img_bgra.flatten()))
+    
+    engine = OcrEngine.try_create_from_language(Language("ja-JP"))
+    if not engine:
+        engine = OcrEngine.try_create_from_user_profile_languages()
+        
+    if not engine:
+        logger.error("OCR Engine could not be created.")
+        return None
+        
+    ocr_result = await engine.recognize_async(software_bitmap)
+    
+    if not ocr_result or not ocr_result.lines:
+        logger.info("OCRでテキストが見つかりませんでした。")
+        return None
+        
+    # 抽出ロジック（ヒューリスティック）
+    # "Submit" や "Proceed" という単語を探す
+    submit_btn = None
+    options = []
+    question_lines = []
+    
+    lines = ocr_result.lines
+    for i, line in enumerate(lines):
+        text = line.text
+        # Submitボタン探し
+        if "Submit" in text or "Proceed" in text or "送信" in text:
+            # 最初の単語の矩形をボタンの中心とする
+            rect_w = line.words[0].bounding_rect
+            cx = int(rect_w.x + rect_w.width / 2) + chat_global_offset_x
+            cy = int(rect_w.y + rect_w.height / 2) + chat_global_offset_y
+            submit_btn = {"center_x": cx, "center_y": cy}
+            
+        # 選択肢探し（"1." "2." "○" "・" で始まる行などを選択肢とみなす）
+        # 簡単のため、Submitボタンより上で、短めの行を選択肢候補とする
+        elif len(text) < 50:
+            rect_w = line.words[0].bounding_rect
+            cx = int(rect_w.x + rect_w.width / 2) + chat_global_offset_x
+            cy = int(rect_w.y + rect_w.height / 2) + chat_global_offset_y
+            options.append({
+                "id": f"opt_ocr_{i}",
+                "text": text,
+                "center_x": cx,
+                "center_y": cy,
+                "rect_y": rect_w.y # Y座標でソート用
+            })
+            
+    # Submitボタンより下にある選択肢は除外
+    if submit_btn:
+        options = [o for o in options if o["center_y"] < submit_btn["center_y"]]
+        
+    # デバッグ画像に描画
+    dbg_img = cv2.imread(debug_filename)
+    if submit_btn:
+        cv2.circle(dbg_img, (submit_btn["center_x"] - chat_global_offset_x, submit_btn["center_y"] - chat_global_offset_y), 5, (0, 0, 255), -1)
+    for opt in options:
+        cv2.circle(dbg_img, (opt["center_x"] - chat_global_offset_x, opt["center_y"] - chat_global_offset_y), 5, (0, 255, 0), -1)
+    cv2.imwrite(debug_filename, dbg_img)
+    
+    if not options:
+        logger.info("OCR: 選択肢候補が見つかりません。")
+        return None
+        
+    # 質問文はOCR結果の上位にあるテキストと仮定
+    question_text = "\n".join([line.text for line in lines[:3]])
+    
+    return {
+        "method": "ocr",
+        "question": question_text,
+        "options": options,
+        "submit_btn": submit_btn
+    }
+
+@app.get("/api/session_state")
+def api_get_session_state(x_bridge_token: str = Header(...)):
+    check_token(x_bridge_token)
+    return get_session_state()
+
+@app.post("/api/click_proceed")
+def api_click_proceed(x_bridge_token: str = Header(...)):
+    check_token(x_bridge_token)
+    
+    # ウィンドウの特定と前面化
+    windows = get_visible_windows()
+    target_hwnd = None
+    for hwnd, title in windows:
+        title_lower = title.lower()
+        for allowed in ALLOWED_TITLES:
+            if allowed in title_lower:
+                target_hwnd = hwnd
+                break
+        if target_hwnd:
+            break
+            
+    if not target_hwnd:
+        raise HTTPException(status_code=400, detail="対象のウィンドウが見つかりません。")
+        
+    bring_window_to_front(target_hwnd)
+    time.sleep(0.8)  # 前面化を待つ
+    
+    success = find_and_click_green_proceed_button()
+    if success:
+        return {"status": "success", "message": "PC側で Proceed ボタンを検出してクリックしました。"}
+    else:
+        raise HTTPException(status_code=404, detail="画面上に Proceed ボタン（緑色）が見つかりませんでした。")
+
+@app.get("/api/chat_history")
+def api_get_chat_history(x_bridge_token: str = Header(...)):
+    check_token(x_bridge_token)
+    return get_chat_history()
+
+@app.get("/api/history")
+def api_get_history(x_bridge_token: str = Header(...)):
+    check_token(x_bridge_token)
+    if os.path.exists(HISTORY_PATH):
+        try:
+            with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+@app.get("/api/config")
+def api_get_config(x_bridge_token: str = Header(...)):
+    check_token(x_bridge_token)
+    return {
+        "enable_auto_send": ENABLE_AUTO_SEND,
+        "send_key": SEND_KEY,
+        "has_calibration": (BG_COLOR_CHAT_OPENED is not None and BG_COLOR_CHAT_CLOSED is not None)
+    }
+
+# ---------- 生の会話ログ取得エンドポイント ----------
+from fastapi.responses import PlainTextResponse
+
+@app.get("/api/raw_transcript")
+def api_raw_transcript(x_bridge_token: str = Header(...)):
+    check_token(x_bridge_token)
+    raw = get_raw_transcript()
+    if not raw:
+        raise HTTPException(status_code=404, detail="Transcript not found")
+    return PlainTextResponse(content=raw, media_type="text/plain")
+
+class CalibrateRequest(BaseModel):
+    state: str  # "opened" / "closed"
+
+@app.post("/api/calibrate")
+def api_calibrate(request: CalibrateRequest, x_bridge_token: str = Header(...)):
+    check_token(x_bridge_token)
+    
+    state = request.state
+    if state not in ["opened", "closed"]:
+        raise HTTPException(status_code=400, detail="Invalid state. Choose 'opened' or 'closed'.")
+        
+    # ウィンドウの特定
+    windows = get_visible_windows()
+    logger.info(f"キャリブレーション: 検出されたウィンドウ数={len(windows)}, 許可リスト={ALLOWED_TITLES}")
+    target_hwnd = None
+    for hwnd, title in windows:
+        title_lower = title.lower()
+        logger.info(f"  ウィンドウ: HWND={hwnd}, タイトル='{title}'")
+        for allowed in ALLOWED_TITLES:
+            if allowed in title_lower:
+                target_hwnd = hwnd
+                break
+        if target_hwnd:
+            break
+            
+    if not target_hwnd:
+        logger.warning(f"キャリブレーション: 許可リストに一致するウィンドウが見つかりません。検出数={len(windows)}")
+        raise HTTPException(status_code=400, detail=f"対象のウィンドウが見つかりません。検出されたウィンドウ数: {len(windows)}")
+        
+    # 最前面化
+    bring_window_to_front(target_hwnd)
+    time.sleep(0.5)  # 最前面化を待つ
+    
+    # 色サンプリング
+    color = get_pixel_color_at_relative(target_hwnd)
+    if not color:
+        raise HTTPException(status_code=500, detail="ピクセルカラーの取得に失敗しました。")
+        
+    # 設定の更新と保存
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            curr_config = json.load(f)
+            
+        key_name = "bg_color_chat_opened" if state == "opened" else "bg_color_chat_closed"
+        curr_config[key_name] = list(color)
+        
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(curr_config, f, ensure_ascii=False, indent=2)
+            
+        logger.info(f"キャリブレーション完了: {state} の色を {color} に保存しました。")
+        
+        # グローバル変数も即時更新
+        global BG_COLOR_CHAT_OPENED, BG_COLOR_CHAT_CLOSED
+        if state == "opened":
+            BG_COLOR_CHAT_OPENED = color
+        else:
+            BG_COLOR_CHAT_CLOSED = color
+            
+        return {"status": "success", "message": f"チャットが【{'開いている' if state == 'opened' else '閉じている'}】状態の背景色を登録しました。"}
+    except Exception as e:
+        logger.error(f"キャリブレーションデータの保存に失敗しました: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save calibration data: {e}")
+
+def save_history(text: str):
+    """送信されたテキストを履歴ファイルに保存します。"""
+    history = []
+    if os.path.exists(HISTORY_PATH):
+        try:
+            with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+                history = json.load(f)
+        except Exception:
+            history = []
+            
+    # 重複防止（直近と同じテキストなら保存しない、または順番入れ替え）
+    history = [h for h in history if h.get("text") != text]
+    
+    history.insert(0, {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "text": text
+    })
+    
+    # 最大30件保存
+    history = history[:30]
+    
+    try:
+        with open(HISTORY_PATH, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"履歴の保存に失敗しました: {e}")
+
+# ==================== 起動処理 ====================
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    local_ip = get_local_ip()
+    access_url = f"http://{local_ip}:{PORT}/?token={SECURITY_TOKEN}"
+    
+    print("\n" + "="*70)
+    print("        Mobile Prompt Bridge MVP (Started)")
+    print("="*70)
+    print(f"\n[URL]\n-->  {access_url}\n")
+    print("Please open the URL above on your mobile phone browser.")
+    print("="*70)
+    print("Security Alert:")
+    print(f"- Random token ({SECURITY_TOKEN}) is integrated in the URL.")
+    print("- Only accessible within the same local network.")
+    print("- Press Ctrl + C to exit this server.")
+    print("="*70 + "\n")
+
+    
+    # 0.0.0.0で待ち受け（LAN内の他デバイスからアクセスできるようにするため）
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
