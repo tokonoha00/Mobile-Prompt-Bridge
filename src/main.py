@@ -653,6 +653,9 @@ class PasteRequest(BaseModel):
     text: str
     action: str  # "copy" / "paste" / "paste_send"
 
+class SetTargetWindowRequest(BaseModel):
+    hwnd: int
+
 # ---------- 会話ログ取得用ヘルパー ----------
 def get_raw_transcript() -> str:
     """最新の transcript.jsonl を文字列として返す。"""
