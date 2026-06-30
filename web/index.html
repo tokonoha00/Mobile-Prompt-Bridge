@@ -484,7 +484,7 @@
     
         /* IDEウィンドウ切り替えタブ (付箋風) */
         .ide-tabs-container {
-            position: absolute;
+            position: fixed;
             top: 10px;
             left: 10px;
             z-index: 1000;
@@ -503,7 +503,8 @@
             box-shadow: 2px 4px 8px rgba(0,0,0,0.4);
             cursor: pointer;
             transition: all 0.2s ease;
-            max-width: 140px;
+            max-width: 80px;
+            text-align: center;
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
@@ -1194,6 +1195,10 @@
     const ideTabsContainer = document.getElementById('ideTabsContainer');
     const fabBtn = document.getElementById('fabBtn');
 
+    // HWND to IDE ID mapping for stable naming
+    const hwidMapping = {};
+    let nextIdeId = 1;
+
     fabBtn.addEventListener('click', () => {
         showToast("このボタンの機能は今後追加予定です！");
     });
@@ -1223,9 +1228,11 @@
                 tab.classList.add('active');
             }
             
-            let shortTitle = win.title.split(' - ')[0];
-            if (shortTitle.length > 15) shortTitle = shortTitle.substring(0, 15) + '...';
-            tab.textContent = shortTitle;
+            // stable ID mapping
+            if (!hwidMapping[win.hwnd]) {
+                hwidMapping[win.hwnd] = nextIdeId++;
+            }
+            tab.textContent = `IDE${hwidMapping[win.hwnd]}`;
 
             tab.addEventListener('click', async () => {
                 await setTargetWindow(win.hwnd);
