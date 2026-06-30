@@ -16,12 +16,19 @@
 
 ## 📦 インストール方法
 
+### 手動でインストールする場合
 1. このリポジトリを `git clone` するか、ZIPでダウンロードして解凍します。
 2. コマンドプロンプトまたはPowerShellを開き、ダウンロードしたプロジェクトのフォルダ（`Mobile-Prompt-Bridge` の中）に移動し、必要なライブラリをインストールします。
    ```bash
    cd 任意のパス/Mobile-Prompt-Bridge
    pip install -r requirements.txt
    ```
+
+### 🤖 AIエージェントに全自動で導入させる場合（おすすめ！）
+Cursor、Windsurf、Antigravity IDE などのエージェント型AIをお使いの場合は、面倒なセットアップを全てAIに任せることができます。
+1. エディタで `agent_setup_prompt.md` ファイルを開きます。
+2. 中に書かれているプロンプトをコピーし、ご自身のAIアシスタントにチャットで送信してください。
+3. Pythonパッケージのインストールから起動、接続URLの発行までをAIが全自動で行ってくれます。
 
 ---
 
