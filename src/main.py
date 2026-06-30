@@ -31,6 +31,9 @@ from winsdk.windows.graphics.imaging import SoftwareBitmap, BitmapPixelFormat, B
 # グローバルなスキャン結果保存用
 LATEST_SCAN_RESULT = None
 
+# 操作対象のIDEウィンドウハンドル
+GLOBAL_TARGET_HWND = None
+
 # ログディレクトリの作成
 os.makedirs("logs", exist_ok=True)
 
@@ -691,6 +694,53 @@ def get_index(token: str = Query(None)):
         logger.error(f"HTMLファイルが見つかりません: {html_path}")
         raise HTTPException(status_code=404, detail="HTML file not found")
 
+def get_active_target_hwnd(windows):
+    global GLOBAL_TARGET_HWND
+    
+    # Check if GLOBAL_TARGET_HWND is still valid and matches allowed titles
+    if GLOBAL_TARGET_HWND:
+        for hwnd, title in windows:
+            if hwnd == GLOBAL_TARGET_HWND:
+                title_lower = title.lower()
+                if any(allowed in title_lower for allowed in ALLOWED_TITLES):
+                    return hwnd, title
+        # If we reach here, the selected window was closed or title changed to invalid
+        GLOBAL_TARGET_HWND = None
+        
+    # Fallback to the first matching window
+    for hwnd, title in windows:
+        title_lower = title.lower()
+        if any(allowed in title_lower for allowed in ALLOWED_TITLES):
+            GLOBAL_TARGET_HWND = hwnd
+            return hwnd, title
+            
+    return None, None
+
+@app.get("/api/ide_windows")
+def api_ide_windows(x_bridge_token: str = Header(...)):
+    check_token(x_bridge_token)
+    windows = get_visible_windows()
+    ide_windows = []
+    
+    for hwnd, title in windows:
+        title_lower = title.lower()
+        if any(allowed in title_lower for allowed in ALLOWED_TITLES):
+            ide_windows.append({"hwnd": hwnd, "title": title})
+            
+    # Auto-select if none selected
+    global GLOBAL_TARGET_HWND
+    if not GLOBAL_TARGET_HWND and ide_windows:
+        GLOBAL_TARGET_HWND = ide_windows[0]["hwnd"]
+            
+    return {"status": "success", "windows": ide_windows, "active_hwnd": GLOBAL_TARGET_HWND}
+
+@app.post("/api/set_target_window")
+def api_set_target_window(request: SetTargetWindowRequest, x_bridge_token: str = Header(...)):
+    check_token(x_bridge_token)
+    global GLOBAL_TARGET_HWND
+    GLOBAL_TARGET_HWND = request.hwnd
+    return {"status": "success"}
+
 @app.post("/api/paste")
 def api_paste(request: PasteRequest, x_bridge_token: str = Header(...)):
     check_token(x_bridge_token)
@@ -730,21 +780,9 @@ def api_paste(request: PasteRequest, x_bridge_token: str = Header(...)):
         save_history(text)
         return {"status": "success", "message": "PCクリップボードにコピーしました。"}
         
-    # 2. 対象ウィンドウの検索 (paste / paste_send の場合)
+    # 2. 対象ウィンドウの検索
     windows = get_visible_windows()
-    target_hwnd = None
-    target_title = None
-    
-    # 許可されたウィンドウタイトルに一致するものを探す
-    for hwnd, title in windows:
-        title_lower = title.lower()
-        for allowed in ALLOWED_TITLES:
-            if allowed in title_lower:
-                target_hwnd = hwnd
-                target_title = title
-                break
-        if target_hwnd:
-            break
+    target_hwnd, target_title = get_active_target_hwnd(windows)
             
     if not target_hwnd:
         logger.warning("許可リストに一致するアクティブウィンドウが見つかりません。")
