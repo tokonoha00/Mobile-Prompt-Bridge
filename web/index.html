@@ -706,21 +706,7 @@
     const questionSubmitBtn = document.getElementById('questionSubmitBtn');
     const questionSubmitStatus = document.getElementById('questionSubmitStatus');
     const questionContainer = document.getElementById('questionContainer');
-    const btnScanQuestion = document.getElementById('btnScanQuestion');
-    const questionScanMethod = document.getElementById('questionScanMethod');
-
-    // 画面スキャン
-    btnScanQuestion.addEventListener('click', async () => {
-        btnScanQuestion.disabled = true;
-        btnScanQuestion.textContent = "PC画面をスキャン中...";
-        questionScanMethod.textContent = "";
-        
-        try {
-            const response = await fetch('/api/scan_question_screen', {
-                method: 'POST',
-                headers: apiHeaders()
-            });
-            const resData = await response.json();
+                const resData = await response.json();
             
             if (response.ok && resData.ok) {
                 showToast("質問を読み取りました");
