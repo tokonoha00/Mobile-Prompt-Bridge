@@ -716,16 +716,36 @@
     const btnScanQuestion = document.getElementById('btnScanQuestion');
     const questionScanMethod = document.getElementById('questionScanMethod');
 
-    // 画面スキャン
-                const resData = await response.json();
-            
-            if (response.ok && resData.ok) {
-                showToast("質問を読み取りました");
-                activeQuestionId = resData.question_id;
+    // --- 質問自動スキャン ---
+    const autoScanInterval = document.getElementById('autoScanInterval');
+    let scanTimer = null;
+    let lastScanErrorShown = false; // エラーが連続して出るのを防ぐ
+
+    function triggerScan(isManual = false) {
+        if (btnScanQuestion.disabled) return;
+        
+        btnScanQuestion.disabled = true;
+        if (isManual) btnScanQuestion.textContent = "スキャン中...";
+        questionScanMethod.textContent = "";
+
+        fetch('/api/scan_question_screen', {
+            method: 'POST',
+            headers: apiHeaders()
+        })
+        .then(res => res.json())
+        .then(resData => {
+            btnScanQuestion.disabled = false;
+            btnScanQuestion.textContent = "手動スキャン";
+
+            if (resData.status === "success" || resData.ok) {
+                lastScanErrorShown = false;
+                if (isManual) showToast("質問を読み取りました");
                 questionScanMethod.textContent = `方式: ${resData.method}`;
+                
+                activeQuestionId = resData.question_id;
                 questionText.textContent = resData.question;
                 
-                selectedOptionIndex = null; // option_id を保存する
+                selectedOptionIndex = null;
                 questionSubmitBtn.disabled = true;
                 
                 questionOptions.innerHTML = resData.options.map((opt) => {
@@ -739,16 +759,55 @@
                 }).join('');
                 
                 questionContainer.style.display = 'flex';
+                
             } else {
-                showToast(resData.detail || "PC画面から質問を検出できませんでした", true);
+                questionScanMethod.textContent = "見つかりません";
                 questionContainer.style.display = 'none';
+                
+                if (isManual) showToast(resData.detail || "PC画面から質問を検出できませんでした", true);
+                
+                if (!lastScanErrorShown) {
+                    addTransientErrorLog("⚠️ 画面上に質問が見つかりません（またはOCR失敗）");
+                    lastScanErrorShown = true;
+                }
             }
-        } catch (e) {
-            showToast("通信エラーが発生しました", true);
-        } finally {
+        })
+        .catch(err => {
             btnScanQuestion.disabled = false;
-            btnScanQuestion.textContent = "画面をスキャンして質問を読み取る";
+            btnScanQuestion.textContent = "手動スキャン";
+            questionScanMethod.textContent = "通信エラー";
+            
+            if (isManual) showToast("通信エラーが発生しました", true);
+            
+            if (!lastScanErrorShown) {
+                addTransientErrorLog("⚠️ スキャンAPIとの通信に失敗しました");
+                lastScanErrorShown = true;
+            }
+        });
+    }
+
+    function addTransientErrorLog(msg) {
+        const existingErrors = document.querySelectorAll('.transient-error');
+        existingErrors.forEach(el => el.remove());
+
+        const div = document.createElement('div');
+        div.className = 'message system transient-error';
+        div.innerHTML = `<div class="message-content" style="color: #ef4444; background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); padding: 8px;">${msg}</div>`;
+        messagesContainer.appendChild(div);
+        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    }
+
+    autoScanInterval.addEventListener('change', (e) => {
+        if (scanTimer) clearInterval(scanTimer);
+        const ms = parseInt(e.target.value, 10);
+        if (ms > 0) {
+            triggerScan(false);
+            scanTimer = setInterval(() => triggerScan(false), ms);
         }
+    });
+
+    btnScanQuestion.addEventListener('click', () => {
+        triggerScan(true);
     });
 
     window.selectOption = function(optionId, element) {
