@@ -89,11 +89,7 @@ if BG_COLOR_CHAT_CLOSED:
     BG_COLOR_CHAT_CLOSED = tuple(BG_COLOR_CHAT_CLOSED)
 
 # キャッシュ用グローバル変数
-LAST_TRANSCRIPT_PATH = None
-LAST_TRANSCRIPT_MTIME = 0
-LAST_TRANSCRIPT_SIZE = 0
-CACHED_SESSION_STATE = {"logs": [], "active_question": None}
-CACHED_ACTIVE_QUESTION = None
+SESSION_STATE_CACHE_BY_PATH = {}
 
 # 履歴ファイルパス
 HISTORY_PATH = "history.json"
@@ -255,21 +251,130 @@ def get_chat_history():
     state = get_session_state()
     return state.get("logs", [])
 
+
+def get_transcript_path_for_active_instance():
+    global ACTIVE_INSTANCE_ID, INSTANCE_TO_TRANSCRIPT
+    if ACTIVE_INSTANCE_ID and ACTIVE_INSTANCE_ID in INSTANCE_TO_TRANSCRIPT:
+        path = INSTANCE_TO_TRANSCRIPT[ACTIVE_INSTANCE_ID]
+        import os
+        if os.path.exists(path):
+            return path
+    return None
+
 def get_session_state():
-    global LAST_TRANSCRIPT_PATH, LAST_TRANSCRIPT_MTIME, LAST_TRANSCRIPT_SIZE
-    global CACHED_SESSION_STATE, CACHED_ACTIVE_QUESTION
+    global SESSION_STATE_CACHE_BY_PATH, IDE_INSTANCES, ACTIVE_INSTANCE_ID
     
-    path = get_latest_transcript_path()
-    if not path or not os.path.exists(path if path else ""):
-        empty_state = {"logs": [], "active_question": None, "is_unlinked": True}
-        return empty_state
+    path = get_transcript_path_for_active_instance()
+    is_unlinked = False
+    
+    if not path:
+        if len(IDE_INSTANCES) == 1:
+            path = get_latest_transcript_path()
+        else:
+            is_unlinked = True
+            
+    if not path:
+        return {
+            "active_instance_id": ACTIVE_INSTANCE_ID,
+            "transcript_path": None,
+            "is_unlinked": is_unlinked,
+            "logs": [],
+            "active_question": None
+        }
+
+    if path not in SESSION_STATE_CACHE_BY_PATH:
+        SESSION_STATE_CACHE_BY_PATH[path] = {
+            "mtime": 0,
+            "size": 0,
+            "state": {"logs": [], "active_question": None}
+        }
         
+    cache = SESSION_STATE_CACHE_BY_PATH[path]
     try:
-        stat = os.stat(path)
-        mtime = stat.st_mtime
-        size = stat.st_size
+        mtime = os.path.getmtime(path)
+        size = os.path.getsize(path)
+    except OSError:
+        return {
+            "active_instance_id": ACTIVE_INSTANCE_ID,
+            "transcript_path": path,
+            "is_unlinked": is_unlinked,
+            "logs": cache["state"]["logs"],
+            "active_question": cache["state"]["active_question"]
+        }
+
+    if mtime == cache["mtime"] and size == cache["size"]:
+        res = dict(cache["state"])
+        res["active_instance_id"] = ACTIVE_INSTANCE_ID
+        res["transcript_path"] = path
+        res["is_unlinked"] = is_unlinked
+        return res
+
+    logs = []
+    active_question = None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except:
+                    continue
+                
+                # Active Question parsing
+                if "tool_calls" in entry:
+                    for t in entry["tool_calls"]:
+                        if t.get("toolName") == "ask_question":
+                            try:
+                                args = json.loads(t.get("arguments", "{}"))
+                                qs = args.get("questions", [])
+                                if qs:
+                                    q_data = qs[0]
+                                    active_question = {
+                                        "question": q_data.get("question", ""),
+                                        "options": q_data.get("options", []),
+                                        "is_multi_select": q_data.get("is_multi_select", False)
+                                    }
+                            except:
+                                pass
+                
+                # Role detection
+                role = "unknown"
+                if entry.get("source") == "MODEL":
+                    role = "ai"
+                elif entry.get("source") == "USER_EXPLICIT":
+                    role = "user"
+                elif entry.get("source") == "SYSTEM":
+                    role = "system"
+                    
+                content = entry.get("content", "")
+                if not content and entry.get("tool_calls"):
+                    tool_names = [t.get("toolName") for t in entry["tool_calls"]]
+                    content = f"[Tool Calls: {', '.join(tool_names)}]"
+
+                if content:
+                    logs.append({
+                        "sender": role,
+                        "text": content,
+                        "timestamp": entry.get("timestamp", "00:00:00")
+                    })
     except Exception as e:
-        return CACHED_SESSION_STATE
+        logger.error(f"Error reading transcript: {e}")
+
+    cache["mtime"] = mtime
+    cache["size"] = size
+    cache["state"] = {
+        "logs": logs,
+        "active_question": active_question
+    }
+    
+    return {
+        "active_instance_id": ACTIVE_INSTANCE_ID,
+        "transcript_path": path,
+        "is_unlinked": is_unlinked,
+        "logs": logs,
+        "active_question": active_question
+    }
         
     if path == LAST_TRANSCRIPT_PATH and mtime == LAST_TRANSCRIPT_MTIME and size == LAST_TRANSCRIPT_SIZE:
         return CACHED_SESSION_STATE
@@ -794,10 +899,23 @@ class SetActiveIdeRequest(BaseModel):
 @app.post("/api/set_active_ide")
 def api_set_active_ide(request: SetActiveIdeRequest, x_bridge_token: str = Header(...)):
     check_token(x_bridge_token)
-    global ACTIVE_INSTANCE_ID
+    global ACTIVE_INSTANCE_ID, IDE_INSTANCES, INSTANCE_TO_TRANSCRIPT
+    
+    if request.instance_id not in IDE_INSTANCES:
+        # Refresh windows to see if it exists now
+        api_ide_windows(x_bridge_token)
+        
+    if request.instance_id not in IDE_INSTANCES:
+        raise HTTPException(status_code=400, detail="Instance not found")
+        
     ACTIVE_INSTANCE_ID = request.instance_id
     logger.info(f"Target IDE changed to instance: {ACTIVE_INSTANCE_ID}")
-    return {"status": "success"}
+    
+    return {
+        "status": "success",
+        "active_instance_id": ACTIVE_INSTANCE_ID,
+        "has_linked_transcript": ACTIVE_INSTANCE_ID in INSTANCE_TO_TRANSCRIPT
+    }
 
 @app.post("/api/link_transcript")
 def api_link_transcript(x_bridge_token: str = Header(...)):
@@ -820,7 +938,15 @@ def api_link_transcript(x_bridge_token: str = Header(...)):
     newest = files[0]
     INSTANCE_TO_TRANSCRIPT[ACTIVE_INSTANCE_ID] = newest
     logger.info(f"Linked instance {ACTIVE_INSTANCE_ID} to transcript {newest}")
-    return {"status": "success", "linked_transcript": newest}
+    
+    state = get_session_state()
+    
+    return {
+        "status": "success", 
+        "linked_transcript": newest,
+        "active_instance_id": ACTIVE_INSTANCE_ID,
+        "is_unlinked": state.get("is_unlinked", False)
+    }
 
 @app.post("/api/paste")
 def api_paste(request: PasteRequest, x_bridge_token: str = Header(...)):

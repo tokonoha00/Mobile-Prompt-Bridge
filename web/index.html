@@ -932,6 +932,13 @@
             console.log('[loadChatHistory] response status:', response.status);
             if (response.ok) {
                 const resData = await response.json();
+                
+                if (resData.is_unlinked) {
+                    chatArea.innerHTML = '<div style="font-size: 0.8rem; color: #ef4444; font-weight: 600; text-align: center; padding: 20px;">ログが紐づけられていません<br><br><span style="font-size: 0.75rem; font-weight: 400; color: var(--text-muted);">画面上部の「🔗 紐づける」ボタンを押して、<br>このIDEの対話ログを表示させてください。</span></div>';
+                    chatHistoryStatus.textContent = "未紐づけ";
+                    return;
+                }
+                
                 const history = resData.logs || [];
                 // (ActiveQuestionの自動同期は廃止)
                 
