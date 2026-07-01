@@ -742,7 +742,16 @@ def get_active_target_hwnd(windows):
 @app.get("/api/ide_windows")
 def api_ide_windows(x_bridge_token: str = Header(...)):
     check_token(x_bridge_token)
-    global ACTIVE_INSTANCE_ID, IDE_INSTANCES, INSTANCE_TO_TRANSCRIPT
+    global ACTIVE_INSTANCE_ID, IDE_INSTANCES, INSTANCE_TO_TRANSCRIPT, ALLOWED_TITLES
+    
+    # 設定ファイルを動的に再ロードして最新の設定を反映
+    try:
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                curr_config = json.load(f)
+                ALLOWED_TITLES = [t.lower() for t in curr_config.get("allowed_window_titles", [])]
+    except Exception as e:
+        logger.warning(f"設定ファイルのロードに失敗: {e}")
     
     windows = get_visible_windows()
     instances = []

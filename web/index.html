@@ -1181,16 +1181,37 @@
 
     btnProceed.addEventListener('click', sendProceed);
 
-    // --- IDEウィンドウ複数対応 ---
-    const ideTabsContainer = document.getElementById('ideTabsContainer');
-    const fabBtn = document.getElementById('fabBtn');
+    // --- IDEウィンドウ複数対応 (Dropdown) ---
+    const ideSelector = document.getElementById('ideSelector');
+    const linkTranscriptBtn = document.getElementById('linkTranscriptBtn');
 
-    // HWND to IDE ID mapping for stable naming
+    // Instance ID to IDE number mapping for stable naming
     const hwidMapping = {};
     let nextIdeId = 1;
 
-    fabBtn.addEventListener('click', () => {
-        showToast("このボタンの機能は今後追加予定です！");
+    ideSelector.addEventListener('change', async (e) => {
+        const instanceId = e.target.value;
+        if (!instanceId) return;
+        await setTargetWindow(instanceId);
+        loadIdeWindows(); // 画面更新
+    });
+
+    linkTranscriptBtn.addEventListener('click', async () => {
+        try {
+            const response = await fetch('/api/link_transcript', {
+                method: 'POST',
+                headers: apiHeaders()
+            });
+            if (response.ok) {
+                const data = await response.json();
+                showToast("ログの紐付けが完了しました");
+                loadIdeWindows();
+            } else {
+                showToast("ログの紐付けに失敗しました", true);
+            }
+        } catch (e) {
+            console.error(e);
+        }
     });
 
     async function loadIdeWindows() {
@@ -1200,45 +1221,53 @@
             });
             if (response.ok) {
                 const data = await response.json();
-                renderIdeTabs(data.windows, data.active_hwnd);
+                renderIdeDropdown(data.instances, data.active_instance_id);
             }
         } catch (e) {
             console.error("IDEウィンドウ情報の取得に失敗:", e);
         }
     }
 
-    function renderIdeTabs(windows, activeHwnd) {
-        ideTabsContainer.innerHTML = '';
-        if (!windows || windows.length === 0) return;
+    function renderIdeDropdown(instances, activeInstanceId) {
+        ideSelector.innerHTML = '';
+        if (!instances || instances.length === 0) {
+            const opt = document.createElement('option');
+            opt.value = '';
+            opt.textContent = 'IDEが見つかりません...';
+            ideSelector.appendChild(opt);
+            linkTranscriptBtn.style.display = 'none';
+            return;
+        }
 
-        windows.forEach(win => {
-            const tab = document.createElement('div');
-            tab.className = 'ide-tab';
-            if (win.hwnd === activeHwnd) {
-                tab.classList.add('active');
-            }
+        instances.forEach(inst => {
+            const opt = document.createElement('option');
+            opt.value = inst.instance_id;
             
             // stable ID mapping
-            if (!hwidMapping[win.hwnd]) {
-                hwidMapping[win.hwnd] = nextIdeId++;
+            if (!hwidMapping[inst.instance_id]) {
+                hwidMapping[inst.instance_id] = nextIdeId++;
             }
-            tab.textContent = `IDE${hwidMapping[win.hwnd]}`;
+            opt.textContent = `IDE${hwidMapping[inst.instance_id]}`;
 
-            tab.addEventListener('click', async () => {
-                await setTargetWindow(win.hwnd);
-                loadIdeWindows(); // 画面更新
-            });
-
-            ideTabsContainer.appendChild(tab);
+            if (inst.instance_id === activeInstanceId) {
+                opt.selected = true;
+                if (!inst.has_transcript) {
+                    linkTranscriptBtn.style.display = 'inline-block';
+                } else {
+                    linkTranscriptBtn.style.display = 'none';
+                }
+            }
+            
+            ideSelector.appendChild(opt);
         });
     }
 
-    async function setTargetWindow(hwnd) {
+    async function setTargetWindow(instanceId) {
         try {
-            const response = await fetch('/api/set_target_window', {
+            const response = await fetch('/api/set_active_ide', {
                 method: 'POST',
                 headers: apiHeaders({'Content-Type': 'application/json'}),
-                body: JSON.stringify({ hwnd: hwnd })
+                body: JSON.stringify({ instance_id: instanceId })
             });
             if (response.ok) {
                 showToast("対象のIDEを切り替えました");
