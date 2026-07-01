@@ -4,6 +4,7 @@ import psutil
 import sys
 import json
 import time
+import threading
 import socket
 import secrets
 import logging
@@ -12,6 +13,7 @@ import ctypes
 import subprocess
 import re
 import collections
+import urllib.parse
 from ctypes import wintypes
 from fastapi import FastAPI, Request, Query, Header, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
@@ -34,6 +36,18 @@ LATEST_SCAN_RESULT = None
 ACTIVE_INSTANCE_ID = None
 IDE_INSTANCES = {}
 INSTANCE_TO_TRANSCRIPT = {}
+
+# 複数IDEタブの紐付け(差分検知)用
+# instance_id -> {path: (mtime, size)} 紐付け開始時点のスナップショット (手動フォールバック用)
+PENDING_LINK_SNAPSHOTS = {}
+# 既に何らかのインスタンスに紐づけ済みの transcript パス一覧
+# (同じログファイルが複数タブに誤って紐づくのを防ぐ)
+CLAIMED_TRANSCRIPT_PATHS = set()
+
+# ---- 自動タブ検出(バックグラウンド常時監視)用 ----
+AUTO_DETECT_ENABLED = True
+AUTO_DETECT_INTERVAL_SEC = 1.5
+_BG_LAST_SNAPSHOT = {}
 
 # ログディレクトリの作成
 os.makedirs("logs", exist_ok=True)
@@ -227,17 +241,49 @@ def is_chat_opened(hwnd):
     return False
 
 
-def get_latest_transcript_path():
-    """最も新しく更新された transcript_full.jsonl ファイルのパスを取得します。なければ transcript.jsonl にフォールバックします。"""
+def get_all_transcript_files():
+    """存在する全ての会話フォルダ(conversation-id毎)のtranscriptファイルを列挙します。
+    transcript_full.jsonl があればそれを、無ければ同フォルダの transcript.jsonl を使います。
+    1会話フォルダにつき1パスを返します(複数IDEタブを区別するための土台)。"""
     home = os.path.expanduser("~")
-    
-    pattern_full = os.path.join(home, ".gemini", "antigravity-ide", "brain", "*", ".system_generated", "logs", "transcript_full.jsonl")
-    files = glob.glob(pattern_full)
-    
-    if not files:
-        pattern = os.path.join(home, ".gemini", "antigravity-ide", "brain", "*", ".system_generated", "logs", "transcript.jsonl")
-        files = glob.glob(pattern)
-        
+    brain_root = os.path.join(home, ".gemini", "antigravity-ide", "brain")
+
+    result = []
+    try:
+        conv_dirs = glob.glob(os.path.join(brain_root, "*"))
+    except Exception:
+        conv_dirs = []
+
+    for conv_dir in conv_dirs:
+        full_path = os.path.join(conv_dir, ".system_generated", "logs", "transcript_full.jsonl")
+        light_path = os.path.join(conv_dir, ".system_generated", "logs", "transcript.jsonl")
+        if os.path.exists(full_path):
+            result.append(full_path)
+        elif os.path.exists(light_path):
+            result.append(light_path)
+
+    return result
+
+
+def snapshot_transcript_mtimes():
+    """全transcriptファイルの (mtime, size) スナップショットを取得します。
+    紐付け操作の前後を比較して「どのタブのログが実際に更新されたか」を検出するために使います。"""
+    snap = {}
+    for path in get_all_transcript_files():
+        try:
+            snap[path] = (os.path.getmtime(path), os.path.getsize(path))
+        except OSError:
+            continue
+    return snap
+
+
+def get_latest_transcript_path():
+    """最も新しく更新された transcript_full.jsonl ファイルのパスを取得します。なければ transcript.jsonl にフォールバックします。
+    注意: IDEが1つしか開いていない場合の簡易フォールバック専用です。
+    複数タブがある場合にどのタブのログか特定する用途には使わないでください
+    (「新しい方を選ぶ」だけでは他のタブの更新と混同するため)。"""
+    files = get_all_transcript_files()
+
     if not files:
         logger.warning(f"履歴ファイルが見つかりません。")
         return None
@@ -777,6 +823,15 @@ def find_and_click_green_proceed_button():
 # ==================== FastAPI アプリケーション ====================
 app = FastAPI(title="Mobile Prompt Bridge API")
 
+
+@app.on_event("startup")
+def _start_auto_detect_thread():
+    """サーバー起動時に、複数IDEタブを自動識別するバックグラウンド監視スレッドを開始する。
+    これにより、ユーザーはスマホ側で紐付け操作を行う必要がなくなる
+    (PC側で普段通りIDEに入力するだけで、どのタブのログかが自動的に判定される)。"""
+    t = threading.Thread(target=_transcript_auto_detect_loop, daemon=True)
+    t.start()
+
 class PasteRequest(BaseModel):
     text: str
     action: str  # "copy" / "paste" / "paste_send"
@@ -844,6 +899,262 @@ def get_active_target_hwnd(windows):
             
     return None, None
 
+
+# ==================== 書き込み監視に頼らない静的な紐付け(workspaceStorage方式) ====================
+# Antigravity IDE は VSCode 系のアーキテクチャを持つため、開いているワークスペース(フォルダ)ごとに
+# 「workspaceStorage/<hash>/」という設定フォルダが既に存在する。ここには
+#   - workspace.json  : そのウィンドウで開いているフォルダの絶対パス
+#   - state.vscdb      : そのワークスペースの内部状態(SQLite)。会話ID等が埋め込まれていることがある
+# が入っており、これらは「読むだけ」で済むので、チャットへの書き込みを待つ必要が無い。
+# ただし内部フォーマットは非公開・バージョン依存のため、うまく取れない場合は
+# 従来の書き込み監視(_transcript_auto_detect_tick)にフォールバックする。
+
+_UUID_RE = re.compile(
+    rb'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+)
+
+
+def _find_antigravity_appdata_root():
+    """Antigravity IDE のアプリケーションデータルート(workspaceStorageの親)を探す。
+    フォルダ名がバージョンによって違う("Antigravity" / "Antigravity IDE" 等)ため候補を順に試す。"""
+    candidates = []
+    appdata = os.environ.get("APPDATA")  # Windows: C:\Users\<user>\AppData\Roaming
+    if appdata:
+        candidates += [
+            os.path.join(appdata, "Antigravity IDE"),
+            os.path.join(appdata, "Antigravity"),
+            os.path.join(appdata, "antigravity-ide"),
+        ]
+    for c in candidates:
+        if os.path.isdir(os.path.join(c, "User", "workspaceStorage")):
+            return c
+    return None
+
+
+def _workspace_uri_to_path(uri):
+    """"file:///C:/foo/bar" のようなURI文字列をパスに変換する簡易ヘルパー"""
+    if not uri:
+        return None
+    if uri.startswith("file:///"):
+        try:
+            return urllib.parse.unquote(uri[len("file:///"):])
+        except Exception:
+            return uri[len("file:///"):]
+    return uri
+
+
+def _list_workspace_storage_folders():
+    """workspaceStorage/<hash>/workspace.json を全て読み、
+    { 開いているフォルダ名(小文字): {"state_db": state.vscdbのパス, "folder_path": 絶対パス} }
+    を返す。設定ファイルを読むだけなので即座に(書き込み待ちなしに)実行できる。"""
+    root = _find_antigravity_appdata_root()
+    if not root:
+        return {}
+
+    result = {}
+    ws_root = os.path.join(root, "User", "workspaceStorage")
+    for hash_dir in glob.glob(os.path.join(ws_root, "*")):
+        ws_json_path = os.path.join(hash_dir, "workspace.json")
+        if not os.path.exists(ws_json_path):
+            continue
+        try:
+            with open(ws_json_path, "r", encoding="utf-8") as f:
+                ws_data = json.load(f)
+        except Exception:
+            continue
+
+        folder_uri = ws_data.get("folder") or ws_data.get("workspace")
+        folder_path = _workspace_uri_to_path(folder_uri)
+        if not folder_path:
+            continue
+
+        base_name = os.path.basename(folder_path.rstrip("/\\")).lower()
+        state_db_path = os.path.join(hash_dir, "state.vscdb")
+        result[base_name] = {
+            "folder_path": folder_path,
+            "state_db": state_db_path if os.path.exists(state_db_path) else None,
+        }
+    return result
+
+
+def _get_known_brain_uuids():
+    home = os.path.expanduser("~")
+    brain_root = os.path.join(home, ".gemini", "antigravity-ide", "brain")
+    return {
+        os.path.basename(d) for d in glob.glob(os.path.join(brain_root, "*")) if os.path.isdir(d)
+    }
+
+
+def _find_conversation_ids_in_state_db(state_db_path, known_uuids):
+    """state.vscdb (SQLite)を生バイト単位でスキャンし、実在する brain/<uuid> と一致する
+    UUID文字列を探す。protobufの正式スキーマは非公開のため、埋め込まれた文字列を
+    正規表現で拾う簡易的な方法(=それらしいUUIDが1つも見つからない/複数見つかる場合は
+    誤爆を避けるため諦めてフォールバックする)。"""
+    if not state_db_path or not os.path.exists(state_db_path):
+        return []
+    try:
+        with open(state_db_path, "rb") as f:
+            raw = f.read()
+    except Exception:
+        return []
+
+    found = set()
+    for m in _UUID_RE.finditer(raw):
+        candidate = m.group().decode("ascii").lower()
+        if candidate in known_uuids:
+            found.add(candidate)
+    return list(found)
+
+
+def resolve_transcript_by_workspace(workspace_hint):
+    """ウィンドウタイトルから得た workspace_hint (フォルダ名らしき文字列) を手がかりに、
+    書き込みを一切待たずにtranscriptファイルを特定する。
+    特定できなければ None を返し、呼び出し側は書き込み監視の自動検出にフォールバックする。"""
+    if not workspace_hint:
+        return None
+
+    try:
+        ws_map = _list_workspace_storage_folders()
+        entry = ws_map.get(workspace_hint.strip().lower())
+        if not entry or not entry.get("state_db"):
+            return None
+
+        known_uuids = _get_known_brain_uuids()
+        if not known_uuids:
+            return None
+
+        candidates = _find_conversation_ids_in_state_db(entry["state_db"], known_uuids)
+        if len(candidates) != 1:
+            # 0件(この版のAntigravityでは未対応の形式) or 複数件(過去の会話も含み曖昧)
+            # のいずれの場合も、誤った紐付けをするよりは判定を諦める方が安全
+            return None
+
+        conv_id = candidates[0]
+        home = os.path.expanduser("~")
+        brain_root = os.path.join(home, ".gemini", "antigravity-ide", "brain")
+        full_path = os.path.join(brain_root, conv_id, ".system_generated", "logs", "transcript_full.jsonl")
+        light_path = os.path.join(brain_root, conv_id, ".system_generated", "logs", "transcript.jsonl")
+        if os.path.exists(full_path):
+            return full_path
+        if os.path.exists(light_path):
+            return light_path
+        return None
+    except Exception as e:
+        logger.debug(f"resolve_transcript_by_workspace 失敗(フォールバックします): {e}")
+        return None
+
+
+def _make_instance_id(hwnd, pid, title):
+    return hashlib.sha1(f"{hwnd}:{pid}:{title}".encode()).hexdigest()[:12]
+
+
+def _get_foreground_ide_instance():
+    """現在OSの最前面(フォーカスが当たっている)ウィンドウが許可リストに合致するIDEかどうかを判定し、
+    合致すればそのinstance_idを返す。ユーザーがスマホを一切操作せずPCで普通にタイピングしているだけで
+    この判定に必要な情報が揃う(=追加のPC操作やトークン消費なしで済む)。"""
+    global IDE_INSTANCES, ALLOWED_TITLES
+
+    try:
+        fg_hwnd = user32.GetForegroundWindow()
+    except Exception:
+        return None
+    if not fg_hwnd:
+        return None
+
+    length = user32.GetWindowTextLengthW(fg_hwnd)
+    if length <= 0:
+        return None
+    buffer = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(fg_hwnd, buffer, length + 1)
+    title = buffer.value.strip()
+    if not title:
+        return None
+    title_lower = title.lower()
+    if not any(allowed in title_lower for allowed in ALLOWED_TITLES):
+        return None
+
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(fg_hwnd, ctypes.byref(pid))
+    instance_id = _make_instance_id(fg_hwnd, pid.value, title)
+
+    # /api/ide_windows がまだ呼ばれていない(=フロント未起動)状態でも学習できるよう、
+    # ここでも IDE_INSTANCES に登録しておく
+    if instance_id not in IDE_INSTANCES:
+        ide_type = "antigravity" if "antigravity" in title_lower else "vscode" if "code" in title_lower else "unknown"
+        workspace_hint = title.split(" - ")[0] if " - " in title else title
+        label = f"IDE - {workspace_hint}"
+        if ide_type == "antigravity":
+            label = f"Antigravity - {workspace_hint}"
+        elif ide_type == "vscode":
+            label = f"VSCode - {workspace_hint}"
+        IDE_INSTANCES[instance_id] = {
+            "instance_id": instance_id, "hwnd": fg_hwnd, "pid": pid.value,
+            "ide_type": ide_type, "title": title, "label": label,
+            "workspace_hint": workspace_hint, "is_foreground": True,
+            "has_transcript": instance_id in INSTANCE_TO_TRANSCRIPT
+        }
+
+    return instance_id
+
+
+def _transcript_auto_detect_tick():
+    """1ティック分の自動検出処理。
+    直前のtickからの間に「更新されたtranscriptファイルが1件だけ」で、かつ
+    その間ずっと(あるいは今)特定のIDEウィンドウが最前面にあった場合、
+    そのファイルをそのウィンドウ(インスタンス)に紐付ける。
+    複数ファイルが同時に更新された場合は誤判定を避けるため何もしない。"""
+    global _BG_LAST_SNAPSHOT, INSTANCE_TO_TRANSCRIPT, CLAIMED_TRANSCRIPT_PATHS
+
+    fg_instance = _get_foreground_ide_instance()
+    current_snapshot = snapshot_transcript_mtimes()
+
+    if _BG_LAST_SNAPSHOT and fg_instance:
+        changed_paths = []
+        for path, (mtime, size) in current_snapshot.items():
+            prev = _BG_LAST_SNAPSHOT.get(path)
+            if prev is None:
+                continue  # 新規に出現したファイルは今回は判定せず、次回以降のtickで判定する
+            prev_mtime, prev_size = prev
+            if mtime > prev_mtime or size != prev_size:
+                changed_paths.append(path)
+
+        if len(changed_paths) == 1:
+            path = changed_paths[0]
+            current_owner = None
+            for inst, p in INSTANCE_TO_TRANSCRIPT.items():
+                if p == path:
+                    current_owner = inst
+                    break
+
+            if current_owner is None or current_owner == fg_instance:
+                if INSTANCE_TO_TRANSCRIPT.get(fg_instance) != path:
+                    INSTANCE_TO_TRANSCRIPT[fg_instance] = path
+                    CLAIMED_TRANSCRIPT_PATHS.add(path)
+                    logger.info(f"[自動検出] インスタンス {fg_instance} をログ '{path}' に自動で紐付けました。")
+            else:
+                # 既に別インスタンスに紐付いているファイル -> フォアグラウンド判定がズレている可能性が
+                # あるため上書きはせず、警告のみ出す
+                logger.debug(
+                    f"[自動検出] '{path}' は既にインスタンス {current_owner} に紐付け済みのため、"
+                    f"{fg_instance} への割当はスキップしました。"
+                )
+        elif len(changed_paths) > 1:
+            logger.debug(f"[自動検出] 同一tickで複数ファイルが更新されたため今回は判定をスキップします: {changed_paths}")
+
+    _BG_LAST_SNAPSHOT = current_snapshot
+
+
+def _transcript_auto_detect_loop():
+    logger.info("複数IDEタブの自動検出ループを開始しました。")
+    while True:
+        try:
+            if AUTO_DETECT_ENABLED:
+                _transcript_auto_detect_tick()
+        except Exception as e:
+            logger.error(f"自動検出ループでエラーが発生しました: {e}")
+        time.sleep(AUTO_DETECT_INTERVAL_SEC)
+
+
 @app.get("/api/ide_windows")
 def api_ide_windows(x_bridge_token: str = Header(...)):
     check_token(x_bridge_token)
@@ -873,7 +1184,16 @@ def api_ide_windows(x_bridge_token: str = Header(...)):
                 label = f"Antigravity - {workspace_hint}"
             elif ide_type == "vscode":
                 label = f"VSCode - {workspace_hint}"
-                
+
+            # まだ紐付いていないタブは、書き込みを待たずに済む静的な方法(workspaceStorage)を
+            # まず試す。取れなければ何もしない(バックグラウンドの書き込み監視が後で補完する)。
+            if instance_id not in INSTANCE_TO_TRANSCRIPT:
+                resolved_path = resolve_transcript_by_workspace(workspace_hint)
+                if resolved_path:
+                    INSTANCE_TO_TRANSCRIPT[instance_id] = resolved_path
+                    CLAIMED_TRANSCRIPT_PATHS.add(resolved_path)
+                    logger.info(f"[静的解決] インスタンス {instance_id} をログ '{resolved_path}' に紐付けました。(workspaceStorage方式)")
+
             inst = {
                 "instance_id": instance_id,
                 "hwnd": hwnd,
@@ -919,33 +1239,89 @@ def api_set_active_ide(request: SetActiveIdeRequest, x_bridge_token: str = Heade
 
 @app.post("/api/link_transcript")
 def api_link_transcript(x_bridge_token: str = Header(...)):
+    """紐付けフェーズ1: 現在の全transcriptファイルのmtime/sizeを記録し、
+    対象タブで実際にメッセージを送ってもらうのを待つ状態にする。
+    (ここで「一番新しいファイル」を即決めてしまうと、他のタブの活動と混同するため決めない)"""
     check_token(x_bridge_token)
-    global ACTIVE_INSTANCE_ID, INSTANCE_TO_TRANSCRIPT
+    global ACTIVE_INSTANCE_ID, PENDING_LINK_SNAPSHOTS
     if not ACTIVE_INSTANCE_ID:
         raise HTTPException(status_code=400, detail="No active IDE instance to link.")
-        
-    home = os.path.expanduser("~")
-    pattern_full = os.path.join(home, ".gemini", "antigravity-ide", "brain", "*", ".system_generated", "logs", "transcript_full.jsonl")
-    import glob
-    files = glob.glob(pattern_full)
-    if not files:
-        files = glob.glob(os.path.join(home, ".gemini", "antigravity-ide", "brain", "*", ".system_generated", "logs", "transcript.jsonl"))
-        
-    if not files:
-        raise HTTPException(status_code=404, detail="No transcripts found to link.")
-        
-    files.sort(key=os.path.getmtime, reverse=True)
-    newest = files[0]
-    INSTANCE_TO_TRANSCRIPT[ACTIVE_INSTANCE_ID] = newest
-    logger.info(f"Linked instance {ACTIVE_INSTANCE_ID} to transcript {newest}")
-    
-    state = get_session_state()
-    
+
+    snap = snapshot_transcript_mtimes()
+    PENDING_LINK_SNAPSHOTS[ACTIVE_INSTANCE_ID] = snap
+    logger.info(f"Link start for instance {ACTIVE_INSTANCE_ID}: snapshotted {len(snap)} transcript file(s).")
+
     return {
-        "status": "success", 
-        "linked_transcript": newest,
+        "status": "waiting_for_activity",
         "active_instance_id": ACTIVE_INSTANCE_ID,
-        "is_unlinked": state.get("is_unlinked", False)
+        "message": "対象のIDEタブのチャット欄で何かひとこと送信してから、確定ボタンを押してください。"
+    }
+
+
+@app.post("/api/link_transcript/confirm")
+def api_link_transcript_confirm(x_bridge_token: str = Header(...)):
+    """紐付けフェーズ2: フェーズ1以降にmtime/sizeが変化した(=実際に書き込みがあった)
+    transcriptファイルを特定し、そのファイルを対象タブに紐付ける。
+    他のタブが同時に会話していて複数ファイルが変化した場合は、
+    まだ他インスタンスに紐付けられていないファイルの中から
+    最も変化量(更新時刻の進み)が大きいものを採用する。"""
+    check_token(x_bridge_token)
+    global ACTIVE_INSTANCE_ID, INSTANCE_TO_TRANSCRIPT, PENDING_LINK_SNAPSHOTS, CLAIMED_TRANSCRIPT_PATHS
+
+    if not ACTIVE_INSTANCE_ID:
+        raise HTTPException(status_code=400, detail="No active IDE instance to link.")
+
+    before = PENDING_LINK_SNAPSHOTS.get(ACTIVE_INSTANCE_ID)
+    if before is None:
+        raise HTTPException(status_code=400, detail="先に /api/link_transcript を呼び出してスナップショットを取得してください。")
+
+    after = snapshot_transcript_mtimes()
+
+    candidates = []
+    for path, (mtime_after, size_after) in after.items():
+        mtime_before, size_before = before.get(path, (0, 0))
+        if mtime_after > mtime_before or size_after != size_before:
+            # 既に他のアクティブなインスタンスに紐付け済みのファイルは除外
+            # (自分自身の再紐付けは許可する)
+            already_owned_by_other = any(
+                p == path and inst != ACTIVE_INSTANCE_ID
+                for inst, p in INSTANCE_TO_TRANSCRIPT.items()
+            )
+            if already_owned_by_other:
+                continue
+            delta = mtime_after - mtime_before
+            candidates.append((delta, path))
+
+    if not candidates:
+        return {
+            "status": "waiting_for_activity",
+            "active_instance_id": ACTIVE_INSTANCE_ID,
+            "message": "まだ変化が検出されていません。対象タブでメッセージを送信してから再度お試しください。"
+        }
+
+    # 更新が最も大きい(＝直近で最も活発に書き込まれた)ファイルを採用
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    _, chosen = candidates[0]
+
+    if len(candidates) > 1:
+        logger.warning(
+            f"link_transcript_confirm: 複数の候補ファイルが変化していました({len(candidates)}件)。"
+            f"最も更新量の大きい '{chosen}' を採用します。他のタブと同時に操作した場合は結果を確認してください。"
+        )
+
+    INSTANCE_TO_TRANSCRIPT[ACTIVE_INSTANCE_ID] = chosen
+    CLAIMED_TRANSCRIPT_PATHS.add(chosen)
+    PENDING_LINK_SNAPSHOTS.pop(ACTIVE_INSTANCE_ID, None)
+    logger.info(f"Linked instance {ACTIVE_INSTANCE_ID} to transcript {chosen}")
+
+    state = get_session_state()
+
+    return {
+        "status": "success",
+        "linked_transcript": chosen,
+        "active_instance_id": ACTIVE_INSTANCE_ID,
+        "is_unlinked": state.get("is_unlinked", False),
+        "ambiguous": len(candidates) > 1
     }
 
 @app.post("/api/paste")

@@ -550,7 +550,8 @@
             <select id="ideSelector">
                 <option value="">IDEが見つかりません...</option>
             </select>
-            <button id="linkTranscriptBtn" class="link-btn" style="display:none;" title="このIDEのログに紐づける">🔗 紐づける</button>
+            <span id="ideLinkStatus" class="link-status" style="display:none;">🔍 自動検出中…(PC側でそのタブに入力すると自動で紐づきます)</span>
+            <button id="linkTranscriptBtn" class="link-btn" style="display:none;" title="自動検出が働かない場合の手動フォールバック">🔗 手動で紐づける</button>
         </div>
     </header>
 
@@ -1191,6 +1192,7 @@
     // --- IDEウィンドウ複数対応 (Dropdown) ---
     const ideSelector = document.getElementById('ideSelector');
     const linkTranscriptBtn = document.getElementById('linkTranscriptBtn');
+    const ideLinkStatus = document.getElementById('ideLinkStatus');
 
     // Instance ID to IDE number mapping for stable naming
     const hwidMapping = {};
@@ -1203,21 +1205,66 @@
         loadIdeWindows(); // 画面更新
     });
 
+    // 紐付けは2段階: ①開始(スナップショット) → 対象IDEで発言してもらう → ②確定(差分検出)
+    let linkConfirmPolling = null;
+
+    function stopLinkConfirmPolling() {
+        if (linkConfirmPolling) {
+            clearInterval(linkConfirmPolling);
+            linkConfirmPolling = null;
+        }
+        linkTranscriptBtn.disabled = false;
+        linkTranscriptBtn.textContent = "🔗 手動で紐づける";
+    }
+
     linkTranscriptBtn.addEventListener('click', async () => {
         try {
-            const response = await fetch('/api/link_transcript', {
+            linkTranscriptBtn.disabled = true;
+            const startRes = await fetch('/api/link_transcript', {
                 method: 'POST',
                 headers: apiHeaders()
             });
-            if (response.ok) {
-                const data = await response.json();
-                showToast("ログの紐付けが完了しました");
-                loadIdeWindows();
-            } else {
-                showToast("ログの紐付けに失敗しました", true);
+            if (!startRes.ok) {
+                showToast("紐付けの開始に失敗しました", true);
+                linkTranscriptBtn.disabled = false;
+                return;
             }
+
+            showToast("対象のIDEタブで何かひとこと送信してください…");
+            linkTranscriptBtn.textContent = "⏳ 発言を待っています…";
+
+            // 対象タブでメッセージが送信されるのを数秒おきに自動確認する(最大30秒)
+            let attempts = 0;
+            linkConfirmPolling = setInterval(async () => {
+                attempts++;
+                try {
+                    const confirmRes = await fetch('/api/link_transcript/confirm', {
+                        method: 'POST',
+                        headers: apiHeaders()
+                    });
+                    const data = await confirmRes.json();
+
+                    if (confirmRes.ok && data.status === 'success') {
+                        stopLinkConfirmPolling();
+                        showToast(data.ambiguous
+                            ? "紐付けが完了しました(他タブも同時に活動していたため要確認)"
+                            : "ログの紐付けが完了しました");
+                        loadIdeWindows();
+                        return;
+                    }
+
+                    if (attempts >= 15) { // 約30秒でタイムアウト
+                        stopLinkConfirmPolling();
+                        showToast("発言が検出できませんでした。もう一度お試しください", true);
+                    }
+                } catch (e) {
+                    stopLinkConfirmPolling();
+                    showToast("サーバーとの通信に失敗しました", true);
+                }
+            }, 2000);
         } catch (e) {
             console.error(e);
+            stopLinkConfirmPolling();
         }
     });
 
@@ -1243,6 +1290,7 @@
             opt.textContent = 'IDEが見つかりません...';
             ideSelector.appendChild(opt);
             linkTranscriptBtn.style.display = 'none';
+            ideLinkStatus.style.display = 'none';
             return;
         }
 
@@ -1259,8 +1307,13 @@
             if (inst.instance_id === activeInstanceId) {
                 opt.selected = true;
                 if (!inst.has_transcript) {
+                    // 通常はここでPC操作は不要。バックグラウンドの自動検出が
+                    // 対象タブでの入力を検知次第、自動的に紐づく。
+                    // なかなか紐づかない場合のみ、手動ボタンをフォールバックとして使う。
+                    ideLinkStatus.style.display = 'inline-block';
                     linkTranscriptBtn.style.display = 'inline-block';
                 } else {
+                    ideLinkStatus.style.display = 'none';
                     linkTranscriptBtn.style.display = 'none';
                 }
             }
