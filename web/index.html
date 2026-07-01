@@ -483,64 +483,52 @@
         }
     
         /* IDEウィンドウ切り替えタブ (付箋風) */
-        .ide-tabs-container {
-            position: fixed;
-            top: 10px;
-            left: 10px;
-            z-index: 1000;
+        
+        /* IDE Selector */
+        .ide-selector-wrapper {
             display: flex;
-            flex-direction: column;
-            gap: 6px;
+            gap: 8px;
+            margin-top: 15px;
+            width: 100%;
         }
-
-        .ide-tab {
-            background: linear-gradient(135deg, #fef3c7, #fde68a);
-            color: #92400e;
-            padding: 8px 12px;
-            font-size: 0.8rem;
-            font-weight: 700;
-            border-radius: 4px 12px 12px 4px;
-            box-shadow: 2px 4px 8px rgba(0,0,0,0.4);
-            cursor: pointer;
-            transition: all 0.2s ease;
-            max-width: 80px;
-            text-align: center;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            border-left: 4px solid #f59e0b;
-            opacity: 0.7;
-            transform: rotate(-2deg);
+        #ideSelector {
+            flex: 1;
+            padding: 12px;
+            background: var(--card-bg);
+            color: var(--text-color);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            font-size: 16px;
+            font-family: inherit;
         }
-
-        .ide-tab.active {
-            opacity: 1;
-            transform: scale(1.05) rotate(0deg);
-            box-shadow: 3px 6px 12px rgba(0,0,0,0.6);
-            border-left: 6px solid #d97706;
-            background: linear-gradient(135deg, #fde68a, #fbbf24);
-        }
-
-        /* フローティング＋ボタン */
-        .fab-button {
-            position: fixed;
-            bottom: 20px;
-            right: 20px;
-            width: 56px;
-            height: 56px;
-            border-radius: 50%;
+        .link-btn {
             background: var(--primary);
             color: white;
-            font-size: 28px;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
-            cursor: pointer;
-            z-index: 1000;
-            transition: all 0.2s ease;
             border: none;
+            border-radius: 8px;
+            padding: 0 15px;
+            cursor: pointer;
+            font-weight: bold;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
         }
+        .unlinked-placeholder {
+            text-align: center;
+            padding: 30px 20px;
+            color: var(--text-muted);
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 8px;
+            border: 1px dashed rgba(255,255,255,0.1);
+        }
+
+        
+
+        
+
+        /* フローティング＋ボタン */
+        
 
         .fab-button:active {
             transform: scale(0.9);
@@ -550,20 +538,22 @@
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 </head>
 <body>
-    <!-- IDEウィンドウ切り替えタブ -->
-    <div class="ide-tabs-container" id="ideTabsContainer">
-        <!-- タブが動的に挿入されます -->
-    </div>
-
-    <!-- フローティング＋ボタン -->
-    <button class="fab-button" id="fabBtn">+</button>
+    
 
 
 <div class="container">
+    
     <header>
         <h1>Mobile Prompt Bridge</h1>
-        <p>スマホをPCのテキスト入力端末にするツール</p>
+        <p>スマホからPCのテキスト入力欄へダイレクト送信</p>
+        <div class="ide-selector-wrapper">
+            <select id="ideSelector">
+                <option value="">IDEが見つかりません...</option>
+            </select>
+            <button id="linkTranscriptBtn" class="link-btn" style="display:none;" title="このIDEのログに紐づける">🔗 紐づける</button>
+        </div>
     </header>
+
 
     <div class="main-card">
         <div class="textarea-container">

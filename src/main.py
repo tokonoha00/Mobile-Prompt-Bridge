@@ -32,12 +32,8 @@ from winsdk.windows.graphics.imaging import SoftwareBitmap, BitmapPixelFormat, B
 LATEST_SCAN_RESULT = None
 
 # 操作対象のIDEウィンドウハンドル
-GLOBAL_TARGET_HWND = None
-
-# ログディレクトリの作成
-os.makedirs("logs", exist_ok=True)
-
 # ログ設定
+os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -48,12 +44,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PromptBridge")
 
-# 設定ファイルの処理
+# インスタンスベース管理用のグローバル変数
+ACTIVE_INSTANCE_ID = None
+IDE_INSTANCES = {}
+INSTANCE_TO_TRANSCRIPT = {}
 CONFIG_PATH = "config.json"
-
-# IDEごとのトランスクリプトの紐づけ
-HWND_TO_TRANSCRIPT = {}
-LAST_MAPPED_TRANSCRIPT = None
 TEMPLATE_PATH = "config.example.json"
 
 if not os.path.exists(CONFIG_PATH):
@@ -120,7 +115,7 @@ user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
 user32.GetWindowRect.restype = wintypes.BOOL
 
 def get_visible_windows():
-    """現在アクティブかつ可視状態の全ウィンドウの (HWND, タイトル) のリストを返します。"""
+    """現在アクティブかつ可視状態の全ウィンドウのメタデータを返します。"""
     windows = []
     
     def enum_windows_callback(hwnd, lParam):
@@ -129,7 +124,19 @@ def get_visible_windows():
             if length > 0:
                 buffer = ctypes.create_unicode_buffer(length + 1)
                 user32.GetWindowTextW(hwnd, buffer, length + 1)
-                windows.append((hwnd, buffer.value))
+                title = buffer.value
+                
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                
+                exe_name = "unknown"
+                try:
+                    proc = psutil.Process(pid.value)
+                    exe_name = proc.name()
+                except Exception:
+                    pass
+                    
+                windows.append((hwnd, pid.value, title, exe_name))
         return True
 
     user32.EnumWindows(WNDENUMPROC(enum_windows_callback), 0)
@@ -223,38 +230,31 @@ def is_chat_opened(hwnd):
 
 
 def get_latest_transcript_path():
-    """各IDEウィンドウに対応するトランスクリプトを返し、必要に応じて紐づけを更新します。"""
-    global GLOBAL_TARGET_HWND, HWND_TO_TRANSCRIPT, LAST_MAPPED_TRANSCRIPT
-    home = os.path.expanduser("~")
+    global ACTIVE_INSTANCE_ID, INSTANCE_TO_TRANSCRIPT, IDE_INSTANCES
     
+    if ACTIVE_INSTANCE_ID and ACTIVE_INSTANCE_ID in INSTANCE_TO_TRANSCRIPT:
+        mapped = INSTANCE_TO_TRANSCRIPT[ACTIVE_INSTANCE_ID]
+        if os.path.exists(mapped):
+            return mapped
+            
+    # 紐づけがない場合のフォールバック制御
+    instances_count = len([inst for inst in IDE_INSTANCES.values() if any(allowed in inst["title"].lower() for allowed in ALLOWED_TITLES)])
+    if instances_count >= 2:
+        # 複数IDEがある場合は、未紐づけで勝手に最新を返さない
+        logger.warning(f"Multiple IDEs detected ({instances_count}), blocking fallback to newest transcript for unlinked instance {ACTIVE_INSTANCE_ID}.")
+        return None
+        
+    home = os.path.expanduser("~")
     pattern_full = os.path.join(home, ".gemini", "antigravity-ide", "brain", "*", ".system_generated", "logs", "transcript_full.jsonl")
     files = glob.glob(pattern_full)
-    
     if not files:
-        pattern = os.path.join(home, ".gemini", "antigravity-ide", "brain", "*", ".system_generated", "logs", "transcript.jsonl")
-        files = glob.glob(pattern)
+        files = glob.glob(os.path.join(home, ".gemini", "antigravity-ide", "brain", "*", ".system_generated", "logs", "transcript.jsonl"))
         
     if not files:
         return None
         
-    # 更新日時でソート
     files.sort(key=os.path.getmtime, reverse=True)
-    newest = files[0]
-    
-    # 対象IDEが選択されている場合、新しいログが発生したらそのIDEと紐づける
-    if GLOBAL_TARGET_HWND:
-        if newest != LAST_MAPPED_TRANSCRIPT:
-            HWND_TO_TRANSCRIPT[GLOBAL_TARGET_HWND] = newest
-            LAST_MAPPED_TRANSCRIPT = newest
-
-    # 対象IDEに紐づけられたログがあればそれを返す
-    if GLOBAL_TARGET_HWND and GLOBAL_TARGET_HWND in HWND_TO_TRANSCRIPT:
-        mapped = HWND_TO_TRANSCRIPT[GLOBAL_TARGET_HWND]
-        if os.path.exists(mapped):
-            return mapped
-            
-    # 紐づけがない場合は最新のものを返す（初期状態）
-    return newest
+    return files[0]
 
 def get_chat_history():
     """下位互換性のため、get_session_state()のログ部分のみを返します。"""
@@ -267,7 +267,20 @@ def get_session_state():
     global CACHED_SESSION_STATE, CACHED_ACTIVE_QUESTION
     
     path = get_latest_transcript_path()
-    if not path or not os.path.exists(path):
+    if not path or not os.path.exists(path if path else ""):
+        # 未紐づけ、またはファイルが存在しない場合は空の状態を返す
+        empty_state = {"logs": [], "active_question": None, "is_unlinked": True}
+        return empty_state
+        
+    try:
+        stat = os.stat(path)
+        mtime = stat.st_mtime
+        size = stat.st_size
+    except Exception as e:
+        logger.error(f"Failed to stat {path}: {e}")
+        return CACHED_SESSION_STATE
+        
+    if path == LAST_TRANSCRIPT_PATH and mtime == LAST_TRANSCRIPT_MTIME and size == LAST_TRANSCRIPT_SIZE:
         return CACHED_SESSION_STATE
         
     try:
@@ -717,23 +730,22 @@ def get_index(token: str = Query(None)):
         raise HTTPException(status_code=404, detail="HTML file not found")
 
 def get_active_target_hwnd(windows):
-    global GLOBAL_TARGET_HWND
+    global ACTIVE_INSTANCE_ID, IDE_INSTANCES
     
-    # Check if GLOBAL_TARGET_HWND is still valid and matches allowed titles
-    if GLOBAL_TARGET_HWND:
-        for hwnd, title in windows:
-            if hwnd == GLOBAL_TARGET_HWND:
+    if ACTIVE_INSTANCE_ID and ACTIVE_INSTANCE_ID in IDE_INSTANCES:
+        inst = IDE_INSTANCES[ACTIVE_INSTANCE_ID]
+        for hwnd, pid, title, exe in windows:
+            if hwnd == inst["hwnd"]:
                 title_lower = title.lower()
                 if any(allowed in title_lower for allowed in ALLOWED_TITLES):
                     return hwnd, title
-        # If we reach here, the selected window was closed or title changed to invalid
-        GLOBAL_TARGET_HWND = None
+        ACTIVE_INSTANCE_ID = None
         
-    # Fallback to the first matching window
-    for hwnd, title in windows:
+    for hwnd, pid, title, exe in windows:
         title_lower = title.lower()
         if any(allowed in title_lower for allowed in ALLOWED_TITLES):
-            GLOBAL_TARGET_HWND = hwnd
+            instance_id = hashlib.sha1(f"{hwnd}:{pid}:{title}".encode()).hexdigest()[:12]
+            ACTIVE_INSTANCE_ID = instance_id
             return hwnd, title
             
     return None, None
@@ -741,27 +753,75 @@ def get_active_target_hwnd(windows):
 @app.get("/api/ide_windows")
 def api_ide_windows(x_bridge_token: str = Header(...)):
     check_token(x_bridge_token)
-    windows = get_visible_windows()
-    ide_windows = []
+    global ACTIVE_INSTANCE_ID, IDE_INSTANCES, INSTANCE_TO_TRANSCRIPT
     
-    for hwnd, title in windows:
+    windows = get_visible_windows()
+    instances = []
+    
+    for hwnd, pid, title, exe in windows:
         title_lower = title.lower()
         if any(allowed in title_lower for allowed in ALLOWED_TITLES):
-            ide_windows.append({"hwnd": hwnd, "title": title})
+            instance_id = hashlib.sha1(f"{hwnd}:{pid}:{title}".encode()).hexdigest()[:12]
             
-    # Auto-select if none selected
-    global GLOBAL_TARGET_HWND
-    if not GLOBAL_TARGET_HWND and ide_windows:
-        GLOBAL_TARGET_HWND = ide_windows[0]["hwnd"]
+            ide_type = "antigravity" if "antigravity" in title_lower else "vscode" if "code" in title_lower else "unknown"
+            workspace_hint = title.split(" - ")[0] if " - " in title else title
+            label = f"IDE - {workspace_hint}"
+            if ide_type == "antigravity":
+                label = f"Antigravity - {workspace_hint}"
+            elif ide_type == "vscode":
+                label = f"VSCode - {workspace_hint}"
+                
+            inst = {
+                "instance_id": instance_id,
+                "hwnd": hwnd,
+                "pid": pid,
+                "ide_type": ide_type,
+                "title": title,
+                "label": label,
+                "workspace_hint": workspace_hint,
+                "is_foreground": False,
+                "has_transcript": instance_id in INSTANCE_TO_TRANSCRIPT
+            }
+            instances.append(inst)
+            IDE_INSTANCES[instance_id] = inst
             
-    return {"status": "success", "windows": ide_windows, "active_hwnd": GLOBAL_TARGET_HWND}
+    if not ACTIVE_INSTANCE_ID and instances:
+        ACTIVE_INSTANCE_ID = instances[0]["instance_id"]
+        
+    return {"status": "success", "instances": instances, "active_instance_id": ACTIVE_INSTANCE_ID}
 
-@app.post("/api/set_target_window")
-def api_set_target_window(request: SetTargetWindowRequest, x_bridge_token: str = Header(...)):
+class SetActiveIdeRequest(BaseModel):
+    instance_id: str
+
+@app.post("/api/set_active_ide")
+def api_set_active_ide(request: SetActiveIdeRequest, x_bridge_token: str = Header(...)):
     check_token(x_bridge_token)
-    global GLOBAL_TARGET_HWND
-    GLOBAL_TARGET_HWND = request.hwnd
+    global ACTIVE_INSTANCE_ID
+    ACTIVE_INSTANCE_ID = request.instance_id
+    logger.info(f"Target IDE changed to instance: {ACTIVE_INSTANCE_ID}")
     return {"status": "success"}
+
+@app.post("/api/link_transcript")
+def api_link_transcript(x_bridge_token: str = Header(...)):
+    check_token(x_bridge_token)
+    global ACTIVE_INSTANCE_ID, INSTANCE_TO_TRANSCRIPT
+    if not ACTIVE_INSTANCE_ID:
+        raise HTTPException(status_code=400, detail="No active IDE instance to link.")
+        
+    home = os.path.expanduser("~")
+    pattern_full = os.path.join(home, ".gemini", "antigravity-ide", "brain", "*", ".system_generated", "logs", "transcript_full.jsonl")
+    files = glob.glob(pattern_full)
+    if not files:
+        files = glob.glob(os.path.join(home, ".gemini", "antigravity-ide", "brain", "*", ".system_generated", "logs", "transcript.jsonl"))
+        
+    if not files:
+        raise HTTPException(status_code=404, detail="No transcripts found to link.")
+        
+    files.sort(key=os.path.getmtime, reverse=True)
+    newest = files[0]
+    INSTANCE_TO_TRANSCRIPT[ACTIVE_INSTANCE_ID] = newest
+    logger.info(f"Linked instance {ACTIVE_INSTANCE_ID} to transcript {newest}")
+    return {"status": "success", "linked_transcript": newest}
 
 @app.post("/api/paste")
 def api_paste(request: PasteRequest, x_bridge_token: str = Header(...)):
