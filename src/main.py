@@ -31,6 +31,9 @@ from winsdk.windows.graphics.imaging import SoftwareBitmap, BitmapPixelFormat, B
 
 # グローバルなスキャン結果保存用
 LATEST_SCAN_RESULT = None
+ACTIVE_INSTANCE_ID = None
+IDE_INSTANCES = {}
+INSTANCE_TO_TRANSCRIPT = {}
 
 # ログディレクトリの作成
 os.makedirs("logs", exist_ok=True)
@@ -713,6 +716,102 @@ def get_index(token: str = Query(None)):
     else:
         logger.error(f"HTMLファイルが見つかりません: {html_path}")
         raise HTTPException(status_code=404, detail="HTML file not found")
+
+
+def get_active_target_hwnd(windows):
+    global ACTIVE_INSTANCE_ID, IDE_INSTANCES
+    
+    if ACTIVE_INSTANCE_ID and ACTIVE_INSTANCE_ID in IDE_INSTANCES:
+        inst = IDE_INSTANCES[ACTIVE_INSTANCE_ID]
+        for hwnd, pid, title, exe in windows:
+            if hwnd == inst["hwnd"]:
+                title_lower = title.lower()
+                if any(allowed in title_lower for allowed in ALLOWED_TITLES):
+                    return hwnd, title
+        ACTIVE_INSTANCE_ID = None
+        
+    for hwnd, pid, title, exe in windows:
+        title_lower = title.lower()
+        if any(allowed in title_lower for allowed in ALLOWED_TITLES):
+            instance_id = hashlib.sha1(f"{hwnd}:{pid}:{title}".encode()).hexdigest()[:12]
+            ACTIVE_INSTANCE_ID = instance_id
+            return hwnd, title
+            
+    return None, None
+
+@app.get("/api/ide_windows")
+def api_ide_windows(x_bridge_token: str = Header(...)):
+    check_token(x_bridge_token)
+    global ACTIVE_INSTANCE_ID, IDE_INSTANCES, INSTANCE_TO_TRANSCRIPT
+    
+    windows = get_visible_windows()
+    instances = []
+    
+    for hwnd, pid, title, exe in windows:
+        title_lower = title.lower()
+        if any(allowed in title_lower for allowed in ALLOWED_TITLES):
+            instance_id = hashlib.sha1(f"{hwnd}:{pid}:{title}".encode()).hexdigest()[:12]
+            
+            ide_type = "antigravity" if "antigravity" in title_lower else "vscode" if "code" in title_lower else "unknown"
+            workspace_hint = title.split(" - ")[0] if " - " in title else title
+            label = f"IDE - {workspace_hint}"
+            if ide_type == "antigravity":
+                label = f"Antigravity - {workspace_hint}"
+            elif ide_type == "vscode":
+                label = f"VSCode - {workspace_hint}"
+                
+            inst = {
+                "instance_id": instance_id,
+                "hwnd": hwnd,
+                "pid": pid,
+                "ide_type": ide_type,
+                "title": title,
+                "label": label,
+                "workspace_hint": workspace_hint,
+                "is_foreground": False,
+                "has_transcript": instance_id in INSTANCE_TO_TRANSCRIPT
+            }
+            instances.append(inst)
+            IDE_INSTANCES[instance_id] = inst
+            
+    if not ACTIVE_INSTANCE_ID and instances:
+        ACTIVE_INSTANCE_ID = instances[0]["instance_id"]
+        
+    return {"status": "success", "instances": instances, "active_instance_id": ACTIVE_INSTANCE_ID}
+
+class SetActiveIdeRequest(BaseModel):
+    instance_id: str
+
+@app.post("/api/set_active_ide")
+def api_set_active_ide(request: SetActiveIdeRequest, x_bridge_token: str = Header(...)):
+    check_token(x_bridge_token)
+    global ACTIVE_INSTANCE_ID
+    ACTIVE_INSTANCE_ID = request.instance_id
+    logger.info(f"Target IDE changed to instance: {ACTIVE_INSTANCE_ID}")
+    return {"status": "success"}
+
+@app.post("/api/link_transcript")
+def api_link_transcript(x_bridge_token: str = Header(...)):
+    check_token(x_bridge_token)
+    global ACTIVE_INSTANCE_ID, INSTANCE_TO_TRANSCRIPT
+    if not ACTIVE_INSTANCE_ID:
+        raise HTTPException(status_code=400, detail="No active IDE instance to link.")
+        
+    home = os.path.expanduser("~")
+    pattern_full = os.path.join(home, ".gemini", "antigravity-ide", "brain", "*", ".system_generated", "logs", "transcript_full.jsonl")
+    import glob
+    files = glob.glob(pattern_full)
+    if not files:
+        files = glob.glob(os.path.join(home, ".gemini", "antigravity-ide", "brain", "*", ".system_generated", "logs", "transcript.jsonl"))
+        
+    if not files:
+        raise HTTPException(status_code=404, detail="No transcripts found to link.")
+        
+    files.sort(key=os.path.getmtime, reverse=True)
+    newest = files[0]
+    INSTANCE_TO_TRANSCRIPT[ACTIVE_INSTANCE_ID] = newest
+    logger.info(f"Linked instance {ACTIVE_INSTANCE_ID} to transcript {newest}")
+    return {"status": "success", "linked_transcript": newest}
 
 @app.post("/api/paste")
 def api_paste(request: PasteRequest, x_bridge_token: str = Header(...)):
